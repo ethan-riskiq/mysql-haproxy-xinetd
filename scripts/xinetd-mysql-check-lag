@@ -3,7 +3,11 @@
 # This script checks if a MySQL server should take part in a pool, based on its role and its lag
 #
 
-. xinetd-helper
+. /opt/mysql-haproxy-xinetd/scripts/xinetd-helper
+
+LOCKFILE=/opt/mysql-haproxy-xinetd/cache.lock
+CACHE_FILE=/opt/mysql-haproxy-xinetd/cache
+CACHE_TTL_MIN="-1" # this should be with a minus sign to indicate that we care about a file updated less than this many minutes ago (+ means more than X minutes ago).
 
 # manual override:
 if [ -f /etc/xinetd-mysql/mysql-force-error-ro-pool-hint ] ; then
@@ -25,16 +29,34 @@ if [ -f /etc/xinetd-mysql/mysql-delayed-hint ] ; then
   http_404 "Delayed server: disabled"
 fi
 
-
-# Proceed to lag specific checks
-absolute_lag=$(mysql -h 127.0.0.1 -u ... -p ... -e "select absolute_lag as 'xinetd-mysql-lag' from ...;" -ss 2>/dev/null)
-exit_code=$?
-
-acceptable_lag=5
-
-if [ "$exit_code" != "0" ] ; then
-  http_503 "MySQL error"
+absolute_lag=""
+if test `find $CACHE_FILE -mmin $CACHE_TTL_MIN`; then
+  cached_lag=$(cat "$CACHE_FILE")
+  if [[ "$cached_lag" =~ ^-?[0-9]+$ ]]; then
+    absolute_lag="$cached_lag"
+  fi
 fi
+
+if [ "$absolute_lag" == "" ]; then
+  # Proceed to lag specific checks
+  absolute_lag=$(/usr/bin/mysql -umonitor -pmonitor -e "SHOW SLAVE STATUS\G"| grep "Seconds_Behind_Master" | awk '{ print $2 }')
+  exit_code=$?
+
+  if [ "$exit_code" != "0" ] ; then
+    http_503 "MySQL error"
+  fi
+
+  if [ -e ${LOCKFILE} ] && kill -0 `cat ${LOCKFILE}`; then
+    : # if this instance cannot get a lock, don't worry about writing to the file and use the absolute lag value we have now.
+  else
+    trap "rm -f ${LOCKFILE}; exit" INT TERM EXIT
+    echo $$ > ${LOCKFILE}
+    echo "$absolute_lag" > "$CACHE_FILE"
+    rm -f ${LOCKFILE}
+  fi
+fi
+
+acceptable_lag=300
 
 if [ $absolute_lag -gt $acceptable_lag ] ; then
   http_503 "MySQL lagging"
@@ -45,3 +67,5 @@ if [ $absolute_lag -le $acceptable_lag ] ; then
 fi
 
 http_503 "Unexpected error"
+
+
